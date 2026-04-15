@@ -525,34 +525,38 @@ reg RTC_load = 0;
 //   [13:7]  min   BCD 00-59
 //   [6:0]   sec   BCD 00-59
 //
-// Implemented as a 7-stage clocked state machine to avoid long combinational
-// paths from chained non-power-of-2 divisions, which would cause FPGA timing
-// violations.  Latency is ~7 cycles; the result is updated ~1 second after
-// the first timestamp toggle which is acceptable for RTC initialization.
+// Implemented as a 12-state clocked pipeline to avoid long combinational
+// paths from non-power-of-2 divisions.  Large constants (86400, 365) are
+// factored into small divisors split across two states each, keeping every
+// single-cycle path under 5 ns.  Latency is ~12 cycles; the result is
+// updated ~1 second after the first timestamp toggle, which is acceptable.
 // ---------------------------------------------------------------------------
 reg [41:0] RTC_timestampIn_BCD = 42'd0;
-reg [3:0]  rtc_bcd_state = 0;  // 4 bits; valid states are 0-9 (10 used, 10-15 unused)
+reg [3:0]  rtc_bcd_state = 0;  // 4 bits; valid states 0-11 (12 used, 12-15 unused)
 reg        rtc_ts_new_r = 0;
 
 localparam [31:0] UNIX_2000 = 32'd946684800; // Unix epoch for Jan 1, 2000
 
-// Pipeline working registers (each stage reads its inputs and writes outputs)
-reg [31:0] r_unix           = 0; // seconds since Jan 1, 2000 (≤ ~3.35 billion)
-reg [15:0] r_days           = 0; // days since Jan 1, 2000    (≤ 49710 for 2000-2136)
-reg [16:0] r_remsec         = 0; // intra-day seconds          (0-86399)
-reg [11:0] r_remsec_mod3600 = 0; // r_remsec % 3600            (0-3599)
-reg [4:0]  r_hour           = 0; // 0-23
-reg [5:0]  r_min            = 0; // 0-59
-reg [5:0]  r_sec            = 0; // 0-59
-reg [2:0]  r_wday           = 0; // 0-6  (0=Sunday, 6=Saturday)
-reg [6:0]  r_year           = 0; // 0-99 (offset from 2000)
-reg [6:0]  r_ye_est         = 0; // year estimate from Stage 5 (latched for Stage 7)
-reg [15:0] r_ds_est         = 0; // days at start of r_ye_est  (latched for Stage 7)
-reg [8:0]  r_doy            = 0; // 0-365 (day-of-year, 0-based)
-reg [3:0]  r_month          = 0; // 1-12
-reg [4:0]  r_mday           = 0; // 1-31
+// Pipeline working registers — one non-trivial arithmetic operation per stage so
+// every combinational path between registers is well under the 10 ns clock budget.
+reg [31:0] r_unix    = 0; // seconds since Jan 1, 2000         (≤ 2^32-1)
+reg [20:0] r_temp1   = 0; // r_unix[31:7] / 27                 (≤ 1,242,756)
+reg [15:0] r_days    = 0; // days since Jan 1, 2000             (≤ 49,710)
+reg [16:0] r_remsec  = 0; // intra-day seconds                  (0–86399)
+reg [10:0] r_halfmin = 0; // r_remsec / 60                     (0–1439)
+reg [4:0]  r_hour    = 0; // 0–23
+reg [5:0]  r_min     = 0; // 0–59
+reg [5:0]  r_sec     = 0; // 0–59
+reg [2:0]  r_wday    = 0; // 0–6 (0=Sunday)
+reg [13:0] r_temp5   = 0; // r_days / 5                        (≤ 9,942)
+reg [6:0]  r_year    = 0; // 0–99 (offset from 2000)
+reg [6:0]  r_ye_est  = 0; // year estimate (before correction)
+reg [15:0] r_ds_est  = 0; // days at start of estimated year
+reg [8:0]  r_doy     = 0; // day-of-year, 0-based               (0–365)
+reg [3:0]  r_month   = 0; // 1–12
+reg [4:0]  r_mday    = 0; // 1–31
 
-// Blocking-assignment work variables used within individual stages
+// Blocking work variables used within individual stages
 reg [6:0]  v_ld;
 reg        v_lp;
 reg [3:0]  v_mo;
@@ -563,87 +567,114 @@ always @(posedge clk_sys) begin
 
     case (rtc_bcd_state)
         // -------------------------------------------------------------------
-        4'd0: // Idle: watch for new timestamp toggle
-            if (rtc_ts_new_r != RTC_time[32]) begin
-                r_unix        <= (RTC_time[31:0] >= UNIX_2000) ?
-                                  RTC_time[31:0] - UNIX_2000 : 32'd0;
-                rtc_bcd_state <= 4'd1;
-            end
+        // State 0: Idle — wait for new timestamp toggle from HPS
+        4'd0: if (rtc_ts_new_r != RTC_time[32]) begin
+            r_unix        <= (RTC_time[31:0] >= UNIX_2000) ?
+                              RTC_time[31:0] - UNIX_2000 : 32'd0;
+            rtc_bcd_state <= 4'd1;
+        end
 
         // -------------------------------------------------------------------
-        4'd1: begin // Stage 1: days since epoch (one 32-bit constant division)
-            r_days        <= r_unix / 32'd86400;
+        // State 1: first step of  r_unix / 86400  →  r_days
+        // 86400 = 128 × 27 × 25.  The right-shift by 7 is free (wiring only).
+        // Identity: ⌊⌊⌊n/128⌋/27⌋/25⌋ = ⌊n/86400⌋  (exact for all integer n).
+        // Critical path: 25-bit ÷ 27 (~4 ns)
+        4'd1: begin
+            r_temp1       <= 21'(r_unix[31:7] / 21'd27);
             rtc_bcd_state <= 4'd2;
         end
 
         // -------------------------------------------------------------------
-        4'd2: begin // Stage 2: intra-day seconds (multiply-subtract, fast) + wday
-            // r_days * 86400 fits in 32 bits (max 49710*86400 = 4,293,024,000 < 2^32)
-            r_remsec      <= r_unix - 32'(r_days) * 32'd86400;
-            // Jan 1 2000 (r_days=0) was Saturday = 6; (days+6)%7 gives 0=Sun
-            r_wday        <= (r_days + 16'd6) % 16'd7;
+        // State 2: second step → r_days = r_temp1 / 25
+        // Critical path: 21-bit ÷ 25 (~4 ns)
+        4'd2: begin
+            r_days        <= 16'(r_temp1 / 21'd25);
             rtc_bcd_state <= 4'd3;
         end
 
         // -------------------------------------------------------------------
-        4'd3: begin // Stage 3: hour + sec (single ops); mod3600 for later min calc
-            // Each is a single non-chained bounded division — no two-step chain.
-            r_hour           <= r_remsec / 17'd3600;
-            r_remsec_mod3600 <= r_remsec % 17'd3600; // stored for Stage 4
-            r_sec            <= r_remsec % 17'd60;
-            rtc_bcd_state    <= 4'd4;
+        // State 3: intra-day seconds and weekday (independent paths)
+        // Path A — r_remsec: 16-bit × 17-bit const multiply (DSP block, ~3 ns)
+        //          + 32-bit subtract (~1 ns)  →  total ~4 ns
+        // Path B — r_wday:   16-bit add + mod-7 (~3 ns, independent)
+        // Jan 1 2000 was Saturday (6); (days+6) % 7 maps 0=Sun … 6=Sat.
+        4'd3: begin
+            r_remsec      <= 17'(r_unix - 32'(r_days) * 32'd86400);
+            r_wday        <= 3'((r_days + 16'd6) % 16'd7);
+            rtc_bcd_state <= 4'd4;
         end
 
         // -------------------------------------------------------------------
-        4'd4: begin // Stage 4: minutes — single clean division on pre-computed mod
-            // Avoids the chained (% 3600) / 60 path that violated 10 ns timing.
-            r_min         <= 6'(r_remsec_mod3600 / 12'd60);
+        // State 4: half-minutes and seconds (independent 17-bit paths, ~4 ns each)
+        // Replaces the old single-stage /3600 + %3600 which exceeded timing.
+        4'd4: begin
+            r_halfmin     <= 11'(r_remsec / 17'd60);
+            r_sec         <=  6'(r_remsec % 17'd60);
             rtc_bcd_state <= 4'd5;
         end
 
         // -------------------------------------------------------------------
-        4'd5: begin // Stage 5: year estimate (16-bit constant division)
-            r_year        <= r_days / 16'd365;
+        // State 5: hour and minute (independent 11-bit paths, ~3 ns each)
+        4'd5: begin
+            r_hour        <=  5'(r_halfmin / 11'd60);
+            r_min         <=  6'(r_halfmin % 11'd60);
             rtc_bcd_state <= 4'd6;
         end
 
         // -------------------------------------------------------------------
-        4'd6: begin // Stage 6: compute days-at-start-of-year-estimate (one multiply)
-            // Leap days before year Y (0-based, valid for 2000-2099):
-            //   ld = 0          when Y == 0
-            //   ld = (Y-1)/4+1  otherwise  (/4 is a power-of-2 right shift)
-            // Critical path: subtract + shift + add + multiply + add (~5-6 ns).
-            // The conditional correction is deferred to Stage 7 (no multiply there).
-            v_ld     = (r_year == 7'd0) ? 7'd0 : ((r_year - 7'd1) >> 2) + 7'd1;
-            r_ye_est <= r_year;
-            r_ds_est <= (16'(r_year) * 16'd365) + 16'(v_ld);
+        // State 6: first step of  r_days / 365  →  r_year
+        // 365 = 5 × 73.  Identity: ⌊⌊n/5⌋/73⌋ = ⌊n/365⌋  (exact).
+        // Critical path: 16-bit ÷ 5 (~3 ns)
+        4'd6: begin
+            r_temp5       <= 14'(r_days / 16'd5);
             rtc_bcd_state <= 4'd7;
         end
 
         // -------------------------------------------------------------------
-        4'd7: begin // Stage 7: year correction — compare + mux only, no multiply
-            // If the estimate overshot by 1, correct year and day-of-year using
-            // only subtraction/addition.  The length of (r_ye_est-1) is known from
-            // r_ye_est's low bits: leap iff (r_ye_est-1) % 4 == 0
-            //                           iff  r_ye_est     % 4 == 1
-            //                           iff  r_ye_est[1:0]    == 2'b01
-            if (r_ds_est > r_days) begin
-                r_year <= r_ye_est - 7'd1;
-                // r_doy = r_days - (r_ds_est - year_len) = r_days - r_ds_est + year_len
-                r_doy  <= 9'(r_days) - 9'(r_ds_est) +
-                           (r_ye_est[1:0] == 2'b01 ? 9'd366 : 9'd365);
-            end else begin
-                r_year <= r_ye_est;
-                r_doy  <= 9'(r_days) - 9'(r_ds_est); // 0-based day within year
-            end
+        // State 7: second step → year estimate = r_temp5 / 73
+        // Critical path: 14-bit ÷ 73 (~4 ns)
+        4'd7: begin
+            r_year        <=  7'(r_temp5 / 14'd73);
             rtc_bcd_state <= 4'd8;
         end
 
         // -------------------------------------------------------------------
-        4'd8: begin // Stage 8: month + day-of-month (comparisons only, no division)
-            // Year is leap if year%4==0 (valid for 2000-2099 range)
-            v_lp = (r_year[1:0] == 2'd0);
-            // Month boundaries (0-based day-of-year)
+        // State 8: days at start of estimated year (one small multiply + add)
+        // Leap days before year Y (valid for 2000–2099, leap iff Y%4==0):
+        //   ld = 0              when Y == 0
+        //   ld = (Y-1)/4 + 1   otherwise  (/4 is a power-of-2 right-shift)
+        // Year 2000 itself is a leap year (Y=0 → 0 leap days before it; Y=1 → 1).
+        // Critical path: 7-bit × 9-bit multiply (~2 ns) + add chain (~3 ns)
+        4'd8: begin
+            // v_ld = number of leap days that have elapsed before year r_year
+            v_ld          = (r_year == 7'd0) ? 7'd0 : ((r_year - 7'd1) >> 2) + 7'd1;
+            r_ye_est      <= r_year;
+            r_ds_est      <= (16'(r_year) * 16'd365) + 16'(v_ld);
+            rtc_bcd_state <= 4'd9;
+        end
+
+        // -------------------------------------------------------------------
+        // State 9: year correction — compare + mux + 16-bit subtract, no multiply
+        // If estimate overshot by exactly 1 year, correct using full 16-bit arithmetic
+        // (avoids the truncation-to-9-bit bug that was here previously).
+        // r_ye_est[1:0] == 2'b01  ↔  (r_ye_est-1) % 4 == 0  ↔  prev year is leap
+        4'd9: begin
+            if (r_ds_est > r_days) begin
+                r_year <= r_ye_est - 7'd1;
+                // doy = r_days + year_len - r_ds_est  (≥ 0, ≤ 365; no 9-bit truncation before sub)
+                r_doy  <= 9'(r_days + (r_ye_est[1:0] == 2'b01 ? 16'd366 : 16'd365)
+                             - r_ds_est);
+            end else begin
+                r_year <= r_ye_est;
+                r_doy  <= 9'(r_days - r_ds_est); // 16-bit sub → result 0–365, then narrow
+            end
+            rtc_bcd_state <= 4'd10;
+        end
+
+        // -------------------------------------------------------------------
+        // State 10: month and day-of-month (comparisons only, no division)
+        4'd10: begin
+            v_lp = (r_year[1:0] == 2'd0); // leap year iff year%4==0 (valid 2000–2099)
             if      (r_doy < 9'd31)                      v_mo = 4'd1;
             else if (r_doy < (v_lp ? 9'd60 : 9'd59))    v_mo = 4'd2;
             else if (r_doy < (v_lp ? 9'd91 : 9'd90))    v_mo = 4'd3;
@@ -656,7 +687,6 @@ always @(posedge clk_sys) begin
             else if (r_doy < (v_lp ? 9'd305 : 9'd304))  v_mo = 4'd10;
             else if (r_doy < (v_lp ? 9'd335 : 9'd334))  v_mo = 4'd11;
             else                                          v_mo = 4'd12;
-            // First day-of-year for each month (for mday subtraction)
             case (v_mo)
                 4'd1:  v_ms = 9'd0;
                 4'd2:  v_ms = 9'd31;
@@ -674,12 +704,13 @@ always @(posedge clk_sys) begin
             endcase
             r_month       <= v_mo;
             r_mday        <= 5'(r_doy - v_ms) + 5'd1; // 1-based day-of-month
-            rtc_bcd_state <= 4'd9;
+            rtc_bcd_state <= 4'd11;
         end
 
         // -------------------------------------------------------------------
-        4'd9: begin // Stage 9: BCD-encode all fields and latch output
-            // Inputs are all small (≤7 bits), so divisions by 10 are cheap.
+        // State 11: BCD-encode all fields and latch output
+        // All inputs ≤ 7 bits wide so /10 and %10 are cheap (~2 ns each).
+        4'd11: begin
             RTC_timestampIn_BCD <= {
                 4'(r_year  / 7'd10), 4'(r_year  % 7'd10),  // [41:34] year
                 1'(r_month / 4'd10), 4'(r_month % 4'd10),  // [33:29] month
