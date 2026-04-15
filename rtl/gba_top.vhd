@@ -54,6 +54,7 @@ entity gba_top is
       RTC_timestampSaved    : in     std_logic_vector(31 downto 0); -- timestamp in seconds, saved time
       RTC_savedtimeIn       : in     std_logic_vector(41 downto 0); -- time structure, loaded
       RTC_saveLoaded        : in     std_logic;                     -- must be 0 when loading new game, should go and stay 1 when RTC was loaded and values are valid
+      RTC_timestampIn_BCD   : in     std_logic_vector(41 downto 0); -- current system time pre-converted to BCD (same format as RTC_savedtimeIn)
       RTC_timestampOut      : out    std_logic_vector(31 downto 0); -- timestamp to be saved
       RTC_savedtimeOut      : out    std_logic_vector(41 downto 0); -- time structure to be saved
       RTC_inuse             : out    std_logic := '0';              -- will indicate that RTC is in use and should be saved on next saving
@@ -606,6 +607,7 @@ begin
       RTC_timestampSaved   => RTC_timestampSaved,
       RTC_savedtimeIn      => RTC_savedtimeIn,   
       RTC_saveLoaded       => RTC_saveLoaded,    
+      RTC_timestampIn_BCD  => RTC_timestampIn_BCD,
       RTC_timestampOut     => RTC_timestampOut,  
       RTC_savedtimeOut     => RTC_savedtimeOut,  
       RTC_inuse            => RTC_inuse,         

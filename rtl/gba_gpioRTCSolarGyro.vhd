@@ -27,6 +27,7 @@ entity gba_gpioRTCSolarGyro is
       RTC_timestampSaved   : in     std_logic_vector(31 downto 0); -- timestamp in seconds, saved time
       RTC_savedtimeIn      : in     std_logic_vector(41 downto 0); -- time structure, loaded
       RTC_saveLoaded       : in     std_logic;                     -- must be 0 when loading new game, should go and stay 1 when RTC was loaded and values are valid
+      RTC_timestampIn_BCD  : in     std_logic_vector(41 downto 0); -- current system time pre-converted to BCD (same format as RTC_savedtimeIn)
       RTC_timestampOut     : out    std_logic_vector(31 downto 0); -- timestamp to be saved
       RTC_savedtimeOut     : out    std_logic_vector(41 downto 0); -- time structure to be saved
       RTC_inuse            : out    std_logic := '0';              -- will indicate that RTC is in use and should be saved on next saving
@@ -85,13 +86,13 @@ architecture arch of gba_gpioRTCSolarGyro is
    
    signal secondcount      : integer range 0 to 100000000 := 0; -- 1 second at 100 Mhz
                            
-   signal tm_year          : unsigned(7 downto 0) := x"09";
-   signal tm_mon           : unsigned(4 downto 0) := '1' & x"2";
-   signal tm_mday          : unsigned(5 downto 0) := "11" & x"1";
-   signal tm_wday          : unsigned(2 downto 0) := "110";
-   signal tm_hour          : unsigned(5 downto 0) := "10" & x"3";
-   signal tm_min           : unsigned(6 downto 0) := "101" & x"9";
-   signal tm_sec           : unsigned(6 downto 0) := "100" & x"5";
+   signal tm_year          : unsigned(7 downto 0) := (others => '0');
+   signal tm_mon           : unsigned(4 downto 0) := (others => '0');
+   signal tm_mday          : unsigned(5 downto 0) := (others => '0');
+   signal tm_wday          : unsigned(2 downto 0) := (others => '0');
+   signal tm_hour          : unsigned(5 downto 0) := (others => '0');
+   signal tm_min           : unsigned(6 downto 0) := (others => '0');
+   signal tm_sec           : unsigned(6 downto 0) := (others => '0');
                            
    signal buf_tm_year      : std_logic_vector(7 downto 0);
    signal buf_tm_mon       : std_logic_vector(4 downto 0);
@@ -505,6 +506,17 @@ begin
          RTC_timestampNew_1 <= RTC_timestampNew;
          if (RTC_timestampNew /= RTC_timestampNew_1) then
             RTC_timestamp <= RTC_timestampIn;
+            -- If no saved RTC data has been loaded yet, seed BCD time from the
+            -- system-clock BCD conversion so the game starts at the correct time.
+            if (RTC_saveLoaded = '0') then
+               tm_year <= unsigned(RTC_timestampIn_BCD(41 downto 34));
+               tm_mon  <= unsigned(RTC_timestampIn_BCD(33 downto 29));
+               tm_mday <= unsigned(RTC_timestampIn_BCD(28 downto 23));
+               tm_wday <= unsigned(RTC_timestampIn_BCD(22 downto 20));
+               tm_hour <= unsigned(RTC_timestampIn_BCD(19 downto 14));
+               tm_min  <= unsigned(RTC_timestampIn_BCD(13 downto 7));
+               tm_sec  <= unsigned(RTC_timestampIn_BCD(6 downto 0));
+            end if;
          end if;
    
       end if;

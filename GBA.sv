@@ -512,6 +512,125 @@ wire has_rtc;
 wire cart_rumble;
 reg RTC_load = 0;
 
+// ---------------------------------------------------------------------------
+// Unix timestamp → GBA RTC BCD converter
+// RTC_time[32:0]: bit 32 is the "new timestamp" toggle, bits 31:0 are Unix
+// seconds.  GBA RTC epoch is Jan 1, 2000 = Unix 946684800.
+// Output format (42 bits, same as RTC_savedtimeOut):
+//   [41:34] year  BCD 2-digit (offset from 2000)
+//   [33:29] month BCD 01-12
+//   [28:23] day   BCD 01-31
+//   [22:20] weekday 0-6 (0=Sun)
+//   [19:14] hour  BCD 00-23
+//   [13:7]  min   BCD 00-59
+//   [6:0]   sec   BCD 00-59
+// ---------------------------------------------------------------------------
+wire [41:0] RTC_timestampIn_BCD;
+
+// The converter is purely combinational.  It runs every time RTC_time changes
+// (which is infrequent – once per second at most) so timing is not critical.
+localparam [31:0] UNIX_2000 = 32'd946684800;
+
+wire [31:0] rtc_unix = (RTC_time[31:0] >= UNIX_2000) ? (RTC_time[31:0] - UNIX_2000) : 32'd0;
+
+// Total days and remaining seconds
+wire [31:0] rtc_total_days = rtc_unix / 32'd86400;
+wire [16:0] rtc_rem_sec    = rtc_unix % 32'd86400;
+
+wire [4:0]  rtc_hour_raw   = rtc_rem_sec / 17'd3600;  // 0-23 fits in 5 bits
+wire [5:0]  rtc_min_raw    = (rtc_rem_sec % 17'd3600) / 17'd60;
+wire [5:0]  rtc_sec_raw    = rtc_rem_sec % 17'd60;
+
+// Day-of-week: Jan 1 2000 was Saturday (=6 in GBA convention 0=Sun).
+// (total_days + 6) % 7
+wire [2:0]  rtc_wday = (rtc_total_days + 32'd6) % 32'd7;
+
+// Walk years: each year is 365 days, leap years (div by 4, since 2000-2099
+// all divisible by 400 are only 2000 and it IS a leap year) add 1 extra day.
+// For 2000-2099 a year Y (offset 0-99) is leap if (Y % 4)==0.
+// We iterate up to 100 years – this unrolls, but synthesis handles it as a
+// tree of adds.  Alternatively use the formula:
+//   leap_days_before = (year - 1) / 4 + 1   (for year >= 1)
+//                     = 0                    (for year == 0)
+// years_elapsed = floor((days * 400 + 365*97+366*3 - 1) / (365*400+97))
+// ... which is complex; use the simple iterative approach wrapped in a
+// function so synthesis can constant-propagate as much as possible.
+
+// Simpler closed-form: within 2000-2099, leap days before year Y (0-based):
+//   ld = (Y == 0) ? 0 : ((Y-1)/4 + 1)
+// normal days before year Y = Y*365 + ld
+// We invert: year_est = days / 365, then subtract leap correction.
+
+wire [7:0]  year_est       = rtc_total_days / 32'd365;
+// leap days before year_est (years 0-99 with leap every 4)
+wire [7:0]  ld_est         = (year_est == 0) ? 8'd0 : ((year_est - 8'd1) / 8'd4 + 8'd1);
+// days at start of year_est
+wire [31:0] days_at_year   = (32'(year_est) * 32'd365) + 32'(ld_est);
+// If we overshot (can happen at year boundary) subtract one
+wire [7:0]  rtc_year_raw   = (days_at_year > rtc_total_days) ? (year_est - 8'd1) : year_est;
+wire [7:0]  ld_final        = (rtc_year_raw == 0) ? 8'd0 : ((rtc_year_raw - 8'd1) / 8'd4 + 8'd1);
+wire [31:0] days_at_final   = (32'(rtc_year_raw) * 32'd365) + 32'(ld_final);
+wire [31:0] day_of_year     = rtc_total_days - days_at_final; // 0-based
+
+// Is the current year a leap year?
+wire        is_leap         = (rtc_year_raw % 8'd4 == 8'd0);
+
+// Month lengths (0-based day-of-year boundaries)
+// Walk months: use cumulative days.
+// We use a function to keep the code readable.
+function automatic [4:0] get_month(input [31:0] doy, input is_lp);
+   reg [4:0] m;
+   begin
+      // Jan=31 Feb=28/29 Mar=31 Apr=30 May=31 Jun=30
+      // Jul=31 Aug=31 Sep=30 Oct=31 Nov=30 Dec=31
+      if (doy < 31)                          m = 5'd1;
+      else if (doy < (is_lp ? 60 : 59))     m = 5'd2;
+      else if (doy < (is_lp ? 91 : 90))     m = 5'd3;
+      else if (doy < (is_lp ? 121 : 120))   m = 5'd4;
+      else if (doy < (is_lp ? 152 : 151))   m = 5'd5;
+      else if (doy < (is_lp ? 182 : 181))   m = 5'd6;
+      else if (doy < (is_lp ? 213 : 212))   m = 5'd7;
+      else if (doy < (is_lp ? 244 : 243))   m = 5'd8;
+      else if (doy < (is_lp ? 274 : 273))   m = 5'd9;
+      else if (doy < (is_lp ? 305 : 304))   m = 5'd10;
+      else if (doy < (is_lp ? 335 : 334))   m = 5'd11;
+      else                                   m = 5'd12;
+      get_month = m;
+   end
+endfunction
+
+function automatic [31:0] month_start(input [4:0] m, input is_lp);
+   case (m)
+      5'd1:  month_start = 32'd0;
+      5'd2:  month_start = 32'd31;
+      5'd3:  month_start = is_lp ? 32'd60 : 32'd59;
+      5'd4:  month_start = is_lp ? 32'd91 : 32'd90;
+      5'd5:  month_start = is_lp ? 32'd121 : 32'd120;
+      5'd6:  month_start = is_lp ? 32'd152 : 32'd151;
+      5'd7:  month_start = is_lp ? 32'd182 : 32'd181;
+      5'd8:  month_start = is_lp ? 32'd213 : 32'd212;
+      5'd9:  month_start = is_lp ? 32'd244 : 32'd243;
+      5'd10: month_start = is_lp ? 32'd274 : 32'd273;
+      5'd11: month_start = is_lp ? 32'd305 : 32'd304;
+      5'd12: month_start = is_lp ? 32'd335 : 32'd334;
+      default: month_start = 32'd0;
+   endcase
+endfunction
+
+wire [4:0]  rtc_month_raw  = get_month(day_of_year, is_leap);
+wire [5:0]  rtc_mday_raw   = day_of_year - month_start(rtc_month_raw, is_leap) + 32'd1; // 1-based
+
+// BCD encode each field (tens digit, ones digit packed into the right bit widths)
+wire [7:0]  year_bcd  = {4'(rtc_year_raw / 8'd10),  4'(rtc_year_raw % 8'd10)};
+wire [4:0]  mon_bcd   = {1'(rtc_month_raw / 5'd10),  4'(rtc_month_raw % 5'd10)};
+wire [5:0]  mday_bcd  = {2'(rtc_mday_raw / 6'd10),   4'(rtc_mday_raw % 6'd10)};
+wire [5:0]  hour_bcd  = {2'(rtc_hour_raw / 5'd10),   4'(rtc_hour_raw % 5'd10)};
+wire [6:0]  min_bcd   = {3'(rtc_min_raw / 6'd10),    4'(rtc_min_raw % 6'd10)};
+wire [6:0]  sec_bcd   = {3'(rtc_sec_raw / 6'd10),    4'(rtc_sec_raw % 6'd10)};
+
+assign RTC_timestampIn_BCD = {year_bcd, mon_bcd, mday_bcd, rtc_wday, hour_bcd, min_bcd, sec_bcd};
+// ---------------------------------------------------------------------------
+
 reg [7:0] rumble_reg = 0;
 
 always @(posedge clk_sys) begin
@@ -568,6 +687,7 @@ gba
    .RTC_timestampSaved(time_dout[42 +: 32]),
    .RTC_savedtimeIn(time_dout[0 +: 42]),
    .RTC_saveLoaded(RTC_load),
+   .RTC_timestampIn_BCD(RTC_timestampIn_BCD),
    .RTC_timestampOut(time_din[42 +: 32]),
    .RTC_savedtimeOut(time_din[0 +: 42]),
    .RTC_inuse(has_rtc),
