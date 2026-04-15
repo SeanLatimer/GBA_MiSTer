@@ -513,7 +513,7 @@ wire cart_rumble;
 reg RTC_load = 0;
 
 // ---------------------------------------------------------------------------
-// Unix timestamp → GBA RTC BCD converter
+// Sequential Unix timestamp → GBA RTC BCD converter
 // RTC_time[32:0]: bit 32 is the "new timestamp" toggle, bits 31:0 are Unix
 // seconds.  GBA RTC epoch is Jan 1, 2000 = Unix 946684800.
 // Output format (42 bits, same as RTC_savedtimeOut):
@@ -524,111 +524,154 @@ reg RTC_load = 0;
 //   [19:14] hour  BCD 00-23
 //   [13:7]  min   BCD 00-59
 //   [6:0]   sec   BCD 00-59
+//
+// Implemented as a 7-stage clocked state machine to avoid long combinational
+// paths from chained non-power-of-2 divisions, which would cause FPGA timing
+// violations.  Latency is ~7 cycles; the result is updated ~1 second after
+// the first timestamp toggle which is acceptable for RTC initialization.
 // ---------------------------------------------------------------------------
-wire [41:0] RTC_timestampIn_BCD;
+reg [41:0] RTC_timestampIn_BCD = 42'd0;
+reg [2:0]  rtc_bcd_state = 0;
+reg        rtc_ts_new_r = 0;
 
-// The converter is purely combinational.  It runs every time RTC_time changes
-// (which is infrequent – once per second at most) so timing is not critical.
-localparam [31:0] UNIX_2000 = 32'd946684800;
+localparam [31:0] UNIX_2000 = 32'd946684800; // Unix epoch for Jan 1, 2000
 
-wire [31:0] rtc_unix = (RTC_time[31:0] >= UNIX_2000) ? (RTC_time[31:0] - UNIX_2000) : 32'd0;
+// Pipeline working registers (each stage reads its inputs and writes outputs)
+reg [31:0] r_unix   = 0; // seconds since Jan 1, 2000 (≤ ~3.35 billion)
+reg [15:0] r_days   = 0; // days since Jan 1, 2000    (≤ 49710 for 2000-2136)
+reg [16:0] r_remsec = 0; // intra-day seconds          (0-86399)
+reg [4:0]  r_hour   = 0; // 0-23
+reg [5:0]  r_min    = 0; // 0-59
+reg [5:0]  r_sec    = 0; // 0-59
+reg [2:0]  r_wday   = 0; // 0-6  (0=Sunday, 6=Saturday)
+reg [6:0]  r_year   = 0; // 0-99 (offset from 2000)
+reg [8:0]  r_doy    = 0; // 0-365 (day-of-year, 0-based)
+reg [3:0]  r_month  = 0; // 1-12
+reg [4:0]  r_mday   = 0; // 1-31
 
-// Total days and remaining seconds
-wire [31:0] rtc_total_days = rtc_unix / 32'd86400;
-wire [16:0] rtc_rem_sec    = rtc_unix % 32'd86400;
+// Blocking-assignment work variables for stages 5-7
+reg [6:0]  v_ye;
+reg [6:0]  v_ld;
+reg [15:0] v_ds;
+reg        v_lp;
+reg [3:0]  v_mo;
+reg [8:0]  v_ms;
 
-wire [4:0]  rtc_hour_raw   = rtc_rem_sec / 17'd3600;  // 0-23 fits in 5 bits
-wire [5:0]  rtc_min_raw    = (rtc_rem_sec % 17'd3600) / 17'd60;
-wire [5:0]  rtc_sec_raw    = rtc_rem_sec % 17'd60;
+always @(posedge clk_sys) begin
+    rtc_ts_new_r <= RTC_time[32];
 
-// Day-of-week: Jan 1 2000 was Saturday (=6 in GBA convention 0=Sun).
-// (total_days + 6) % 7
-wire [2:0]  rtc_wday = (rtc_total_days + 32'd6) % 32'd7;
+    case (rtc_bcd_state)
+        // -------------------------------------------------------------------
+        3'd0: // Idle: watch for new timestamp toggle
+            if (rtc_ts_new_r != RTC_time[32]) begin
+                r_unix        <= (RTC_time[31:0] >= UNIX_2000) ?
+                                  RTC_time[31:0] - UNIX_2000 : 32'd0;
+                rtc_bcd_state <= 3'd1;
+            end
 
-// Walk years: each year is 365 days, leap years (div by 4, since 2000-2099
-// all divisible by 400 are only 2000 and it IS a leap year) add 1 extra day.
-// For 2000-2099 a year Y (offset 0-99) is leap if (Y % 4)==0.
-// We iterate up to 100 years – this unrolls, but synthesis handles it as a
-// tree of adds.  Alternatively use the formula:
-//   leap_days_before = (year - 1) / 4 + 1   (for year >= 1)
-//                     = 0                    (for year == 0)
-// years_elapsed = floor((days * 400 + 365*97+366*3 - 1) / (365*400+97))
-// ... which is complex; use the simple iterative approach wrapped in a
-// function so synthesis can constant-propagate as much as possible.
+        // -------------------------------------------------------------------
+        3'd1: begin // Stage 1: days since epoch (one 32-bit constant division)
+            r_days        <= r_unix / 32'd86400;
+            rtc_bcd_state <= 3'd2;
+        end
 
-// Simpler closed-form: within 2000-2099, leap days before year Y (0-based):
-//   ld = (Y == 0) ? 0 : ((Y-1)/4 + 1)
-// normal days before year Y = Y*365 + ld
-// We invert: year_est = days / 365, then subtract leap correction.
+        // -------------------------------------------------------------------
+        3'd2: begin // Stage 2: intra-day seconds (multiply-subtract, fast) + wday
+            // r_days * 86400 fits in 32 bits (max 49710*86400 = 4,293,024,000 < 2^32)
+            r_remsec      <= r_unix - 32'(r_days) * 32'd86400;
+            // Jan 1 2000 (r_days=0) was Saturday = 6; (days+6)%7 gives 0=Sun
+            r_wday        <= (r_days + 16'd6) % 16'd7;
+            rtc_bcd_state <= 3'd3;
+        end
 
-wire [7:0]  year_est       = rtc_total_days / 32'd365;
-// leap days before year_est (years 0-99 with leap every 4)
-wire [7:0]  ld_est         = (year_est == 0) ? 8'd0 : ((year_est - 8'd1) / 8'd4 + 8'd1);
-// days at start of year_est
-wire [31:0] days_at_year   = (32'(year_est) * 32'd365) + 32'(ld_est);
-// If we overshot (can happen at year boundary) subtract one
-wire [7:0]  rtc_year_raw   = (days_at_year > rtc_total_days) ? (year_est - 8'd1) : year_est;
-wire [7:0]  ld_final        = (rtc_year_raw == 0) ? 8'd0 : ((rtc_year_raw - 8'd1) / 8'd4 + 8'd1);
-wire [31:0] days_at_final   = (32'(rtc_year_raw) * 32'd365) + 32'(ld_final);
-wire [31:0] day_of_year     = rtc_total_days - days_at_final; // 0-based
+        // -------------------------------------------------------------------
+        3'd3: begin // Stage 3: H/M/S from intra-day seconds (bounded 17-bit divs)
+            r_hour        <= r_remsec / 17'd3600;
+            r_min         <= (r_remsec % 17'd3600) / 17'd60;
+            r_sec         <= r_remsec % 17'd60;
+            rtc_bcd_state <= 3'd4;
+        end
 
-// Is the current year a leap year?
-wire        is_leap         = (rtc_year_raw % 8'd4 == 8'd0);
+        // -------------------------------------------------------------------
+        3'd4: begin // Stage 4: year estimate (16-bit constant division)
+            r_year        <= r_days / 16'd365;
+            rtc_bcd_state <= 3'd5;
+        end
 
-// Month lengths (0-based day-of-year boundaries)
-// Walk months: use cumulative days.
-// We use a function to keep the code readable.
-function automatic [4:0] get_month(input [31:0] doy, input is_lp);
-   reg [4:0] m;
-   begin
-      // Jan=31 Feb=28/29 Mar=31 Apr=30 May=31 Jun=30
-      // Jul=31 Aug=31 Sep=30 Oct=31 Nov=30 Dec=31
-      if (doy < 31)                          m = 5'd1;
-      else if (doy < (is_lp ? 60 : 59))     m = 5'd2;
-      else if (doy < (is_lp ? 91 : 90))     m = 5'd3;
-      else if (doy < (is_lp ? 121 : 120))   m = 5'd4;
-      else if (doy < (is_lp ? 152 : 151))   m = 5'd5;
-      else if (doy < (is_lp ? 182 : 181))   m = 5'd6;
-      else if (doy < (is_lp ? 213 : 212))   m = 5'd7;
-      else if (doy < (is_lp ? 244 : 243))   m = 5'd8;
-      else if (doy < (is_lp ? 274 : 273))   m = 5'd9;
-      else if (doy < (is_lp ? 305 : 304))   m = 5'd10;
-      else if (doy < (is_lp ? 335 : 334))   m = 5'd11;
-      else                                   m = 5'd12;
-      get_month = m;
-   end
-endfunction
+        // -------------------------------------------------------------------
+        3'd5: begin // Stage 5: correct year for leap days; compute day-of-year
+            // Leap days before year Y (0-based, valid 2000-2099):
+            //   ld = 0          when Y == 0
+            //   ld = (Y-1)/4+1  otherwise  (integer division, power-of-2 shift)
+            v_ye = r_year;
+            v_ld = (v_ye == 7'd0) ? 7'd0 : ((v_ye - 7'd1) / 7'd4 + 7'd1);
+            v_ds = (16'(v_ye) * 16'd365) + 16'(v_ld);
+            if (v_ds > r_days) begin // estimate overshot by exactly 1
+                v_ye = v_ye - 7'd1;
+                v_ld = (v_ye == 7'd0) ? 7'd0 : ((v_ye - 7'd1) / 7'd4 + 7'd1);
+                v_ds = (16'(v_ye) * 16'd365) + 16'(v_ld);
+            end
+            r_year        <= v_ye;
+            r_doy         <= 9'(r_days) - 9'(v_ds); // 0-based day within year
+            rtc_bcd_state <= 3'd6;
+        end
 
-function automatic [31:0] month_start(input [4:0] m, input is_lp);
-   case (m)
-      5'd1:  month_start = 32'd0;
-      5'd2:  month_start = 32'd31;
-      5'd3:  month_start = is_lp ? 32'd60 : 32'd59;
-      5'd4:  month_start = is_lp ? 32'd91 : 32'd90;
-      5'd5:  month_start = is_lp ? 32'd121 : 32'd120;
-      5'd6:  month_start = is_lp ? 32'd152 : 32'd151;
-      5'd7:  month_start = is_lp ? 32'd182 : 32'd181;
-      5'd8:  month_start = is_lp ? 32'd213 : 32'd212;
-      5'd9:  month_start = is_lp ? 32'd244 : 32'd243;
-      5'd10: month_start = is_lp ? 32'd274 : 32'd273;
-      5'd11: month_start = is_lp ? 32'd305 : 32'd304;
-      5'd12: month_start = is_lp ? 32'd335 : 32'd334;
-      default: month_start = 32'd0;
-   endcase
-endfunction
+        // -------------------------------------------------------------------
+        3'd6: begin // Stage 6: month + day-of-month (comparisons only, no division)
+            // Year is leap if year%4==0 (valid for 2000-2099 range)
+            v_lp = (r_year[1:0] == 2'd0);
+            // Month boundaries (0-based day-of-year)
+            if      (r_doy < 9'd31)                      v_mo = 4'd1;
+            else if (r_doy < (v_lp ? 9'd60 : 9'd59))    v_mo = 4'd2;
+            else if (r_doy < (v_lp ? 9'd91 : 9'd90))    v_mo = 4'd3;
+            else if (r_doy < (v_lp ? 9'd121 : 9'd120))  v_mo = 4'd4;
+            else if (r_doy < (v_lp ? 9'd152 : 9'd151))  v_mo = 4'd5;
+            else if (r_doy < (v_lp ? 9'd182 : 9'd181))  v_mo = 4'd6;
+            else if (r_doy < (v_lp ? 9'd213 : 9'd212))  v_mo = 4'd7;
+            else if (r_doy < (v_lp ? 9'd244 : 9'd243))  v_mo = 4'd8;
+            else if (r_doy < (v_lp ? 9'd274 : 9'd273))  v_mo = 4'd9;
+            else if (r_doy < (v_lp ? 9'd305 : 9'd304))  v_mo = 4'd10;
+            else if (r_doy < (v_lp ? 9'd335 : 9'd334))  v_mo = 4'd11;
+            else                                          v_mo = 4'd12;
+            // First day-of-year for each month (for mday subtraction)
+            case (v_mo)
+                4'd1:  v_ms = 9'd0;
+                4'd2:  v_ms = 9'd31;
+                4'd3:  v_ms = v_lp ? 9'd60  : 9'd59;
+                4'd4:  v_ms = v_lp ? 9'd91  : 9'd90;
+                4'd5:  v_ms = v_lp ? 9'd121 : 9'd120;
+                4'd6:  v_ms = v_lp ? 9'd152 : 9'd151;
+                4'd7:  v_ms = v_lp ? 9'd182 : 9'd181;
+                4'd8:  v_ms = v_lp ? 9'd213 : 9'd212;
+                4'd9:  v_ms = v_lp ? 9'd244 : 9'd243;
+                4'd10: v_ms = v_lp ? 9'd274 : 9'd273;
+                4'd11: v_ms = v_lp ? 9'd305 : 9'd304;
+                4'd12: v_ms = v_lp ? 9'd335 : 9'd334;
+                default: v_ms = 9'd0;
+            endcase
+            r_month       <= v_mo;
+            r_mday        <= 5'(r_doy - v_ms) + 5'd1; // 1-based day-of-month
+            rtc_bcd_state <= 3'd7;
+        end
 
-wire [4:0]  rtc_month_raw  = get_month(day_of_year, is_leap);
-wire [5:0]  rtc_mday_raw   = day_of_year - month_start(rtc_month_raw, is_leap) + 32'd1; // 1-based
+        // -------------------------------------------------------------------
+        3'd7: begin // Stage 7: BCD-encode all fields and latch output
+            // Inputs are all small (≤7 bits), so divisions by 10 are cheap.
+            RTC_timestampIn_BCD <= {
+                4'(r_year  / 7'd10), 4'(r_year  % 7'd10),  // [41:34] year
+                1'(r_month / 4'd10), 4'(r_month % 4'd10),  // [33:29] month
+                2'(r_mday  / 5'd10), 4'(r_mday  % 5'd10),  // [28:23] day
+                r_wday,                                       // [22:20] weekday
+                2'(r_hour  / 5'd10), 4'(r_hour  % 5'd10),  // [19:14] hour
+                3'(r_min   / 6'd10), 4'(r_min   % 6'd10),  // [13:7]  minute
+                3'(r_sec   / 6'd10), 4'(r_sec   % 6'd10)   // [6:0]   second
+            };
+            rtc_bcd_state <= 3'd0;
+        end
 
-// BCD encode each field (tens digit, ones digit packed into the right bit widths)
-wire [7:0]  year_bcd  = {4'(rtc_year_raw / 8'd10),  4'(rtc_year_raw % 8'd10)};
-wire [4:0]  mon_bcd   = {1'(rtc_month_raw / 5'd10),  4'(rtc_month_raw % 5'd10)};
-wire [5:0]  mday_bcd  = {2'(rtc_mday_raw / 6'd10),   4'(rtc_mday_raw % 6'd10)};
-wire [5:0]  hour_bcd  = {2'(rtc_hour_raw / 5'd10),   4'(rtc_hour_raw % 5'd10)};
-wire [6:0]  min_bcd   = {3'(rtc_min_raw / 6'd10),    4'(rtc_min_raw % 6'd10)};
-wire [6:0]  sec_bcd   = {3'(rtc_sec_raw / 6'd10),    4'(rtc_sec_raw % 6'd10)};
-
-assign RTC_timestampIn_BCD = {year_bcd, mon_bcd, mday_bcd, rtc_wday, hour_bcd, min_bcd, sec_bcd};
+        default: rtc_bcd_state <= 3'd0;
+    endcase
+end
 // ---------------------------------------------------------------------------
 
 reg [7:0] rumble_reg = 0;
