@@ -532,6 +532,7 @@ reg RTC_load = 0;
 // updated ~1 second after the first timestamp toggle, which is acceptable.
 // ---------------------------------------------------------------------------
 reg [41:0] RTC_timestampIn_BCD = 42'd0;
+reg        rtc_bcd_new = 0;    // toggle: set when BCD output is freshly valid
 reg [3:0]  rtc_bcd_state = 0;  // 4 bits; valid states 0-11 (12 used, 12-15 unused)
 reg        rtc_ts_new_r = 0;
 
@@ -543,7 +544,7 @@ reg [31:0] r_unix    = 0; // seconds since Jan 1, 2000         (≤ 2^32-1)
 reg [20:0] r_temp1   = 0; // r_unix[31:7] / 27                 (≤ 1,242,756)
 reg [15:0] r_days    = 0; // days since Jan 1, 2000             (≤ 49,710)
 reg [16:0] r_remsec  = 0; // intra-day seconds                  (0–86399)
-reg [10:0] r_halfmin = 0; // r_remsec / 60                     (0–1439)
+reg [10:0] r_daymin  = 0; // r_remsec / 60 = minutes elapsed in day (0–1439)
 reg [4:0]  r_hour    = 0; // 0–23
 reg [5:0]  r_min     = 0; // 0–59
 reg [5:0]  r_sec     = 0; // 0–59
@@ -608,7 +609,7 @@ always @(posedge clk_sys) begin
         // State 4: half-minutes and seconds (independent 17-bit paths, ~4 ns each)
         // Replaces the old single-stage /3600 + %3600 which exceeded timing.
         4'd4: begin
-            r_halfmin     <= 11'(r_remsec / 17'd60);
+            r_daymin      <= 11'(r_remsec / 17'd60);
             r_sec         <=  6'(r_remsec % 17'd60);
             rtc_bcd_state <= 4'd5;
         end
@@ -616,8 +617,8 @@ always @(posedge clk_sys) begin
         // -------------------------------------------------------------------
         // State 5: hour and minute (independent 11-bit paths, ~3 ns each)
         4'd5: begin
-            r_hour        <=  5'(r_halfmin / 11'd60);
-            r_min         <=  6'(r_halfmin % 11'd60);
+            r_hour        <=  5'(r_daymin / 11'd60);
+            r_min         <=  6'(r_daymin % 11'd60);
             rtc_bcd_state <= 4'd6;
         end
 
@@ -720,6 +721,7 @@ always @(posedge clk_sys) begin
                 3'(r_min   / 6'd10), 4'(r_min   % 6'd10),  // [13:7]  minute
                 3'(r_sec   / 6'd10), 4'(r_sec   % 6'd10)   // [6:0]   second
             };
+            rtc_bcd_new   <= ~rtc_bcd_new; // signal that BCD output is now stable
             rtc_bcd_state <= 4'd0;
         end
 
@@ -785,6 +787,7 @@ gba
    .RTC_savedtimeIn(time_dout[0 +: 42]),
    .RTC_saveLoaded(RTC_load),
    .RTC_timestampIn_BCD(RTC_timestampIn_BCD),
+   .RTC_timestampIn_BCD_new(rtc_bcd_new),
    .RTC_timestampOut(time_din[42 +: 32]),
    .RTC_savedtimeOut(time_din[0 +: 42]),
    .RTC_inuse(has_rtc),

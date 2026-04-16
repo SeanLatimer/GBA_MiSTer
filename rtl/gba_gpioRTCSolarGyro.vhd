@@ -28,6 +28,7 @@ entity gba_gpioRTCSolarGyro is
       RTC_savedtimeIn      : in     std_logic_vector(41 downto 0); -- time structure, loaded
       RTC_saveLoaded       : in     std_logic;                     -- must be 0 when loading new game, should go and stay 1 when RTC was loaded and values are valid
       RTC_timestampIn_BCD  : in     std_logic_vector(41 downto 0); -- current system time pre-converted to BCD (same format as RTC_savedtimeIn)
+      RTC_timestampIn_BCD_new : in  std_logic;                     -- toggle: pulses when RTC_timestampIn_BCD is freshly valid
       RTC_timestampOut     : out    std_logic_vector(31 downto 0); -- timestamp to be saved
       RTC_savedtimeOut     : out    std_logic_vector(41 downto 0); -- time structure to be saved
       RTC_inuse            : out    std_logic := '0';              -- will indicate that RTC is in use and should be saved on next saving
@@ -70,7 +71,8 @@ architecture arch of gba_gpioRTCSolarGyro is
    constant GYRO_MAX    : integer := 16#0EFF#;
    
    -- RTC
-   signal RTC_timestampNew_1 : std_logic := '0';
+   signal RTC_timestampNew_1     : std_logic := '0';
+   signal RTC_timestampIn_BCD_new_1 : std_logic := '0';
    
    signal saveRTC          : std_logic := '0';
    signal saveRTC_next     : std_logic := '0';
@@ -503,11 +505,14 @@ begin
    
          end if;
          
-         RTC_timestampNew_1 <= RTC_timestampNew;
+         RTC_timestampNew_1        <= RTC_timestampNew;
+         RTC_timestampIn_BCD_new_1 <= RTC_timestampIn_BCD_new;
          if (RTC_timestampNew /= RTC_timestampNew_1) then
             RTC_timestamp <= RTC_timestampIn;
-            -- If no saved RTC data has been loaded yet, seed BCD time from the
-            -- system-clock BCD conversion so the game starts at the correct time.
+         end if;
+         -- Seed BCD time only after the pipeline has finished (BCD_new toggle),
+         -- not at the timestamp-new edge where BCD is still zeros.
+         if (RTC_timestampIn_BCD_new /= RTC_timestampIn_BCD_new_1) then
             if (RTC_saveLoaded = '0') then
                tm_year <= unsigned(RTC_timestampIn_BCD(41 downto 34));
                tm_mon  <= unsigned(RTC_timestampIn_BCD(33 downto 29));
