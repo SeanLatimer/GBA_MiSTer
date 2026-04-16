@@ -512,6 +512,168 @@ wire has_rtc;
 wire cart_rumble;
 reg RTC_load = 0;
 
+// ---------------------------------------------------------------------------
+// GBA RTC BCD converter — timing-safe iterative algorithm.
+// Uses only subtraction and comparison; no wide-operand division.
+// At 100 MHz, worst-case latency ≈ 37 000 cycles (< 0.4 ms), well within
+// the ~1 second HPS timestamp update interval.
+//
+// Output format (42 bits, same as RTC_savedtimeOut):
+//   [41:34] year  BCD 2-digit (offset from 2000)
+//   [33:29] month BCD 01-12
+//   [28:23] day   BCD 01-31
+//   [22:20] weekday 0-6 (0=Sun)
+//   [19:14] hour  BCD 00-23
+//   [13:7]  min   BCD 00-59
+//   [6:0]   sec   BCD 00-59
+// ---------------------------------------------------------------------------
+localparam [31:0] UNIX_2000 = 32'd946684800; // Unix epoch for Jan 1, 2000
+
+reg [41:0] RTC_timestampIn_BCD = 42'd0;
+reg        rtc_bcd_new = 1'b0;
+reg  [2:0] rtc_state   = 3'd0;
+reg        rtc_ts_prev = 1'b0;
+
+// Working registers
+reg [31:0] r_remaining = 32'd0; // multi-purpose: unix offset, time-of-day, day count
+reg [15:0] r_days      = 16'd0; // total days since 2000-01-01
+reg  [2:0] r_wday      =  3'd0; // 0=Sun … 6=Sat; Jan 1 2000 = Saturday = 6
+reg  [4:0] r_hour      =  5'd0; // 0–23
+reg  [5:0] r_min       =  6'd0; // 0–59
+reg  [5:0] r_sec       =  6'd0; // 0–59
+reg  [6:0] r_year      =  7'd0; // 0–99 (year – 2000)
+reg  [3:0] r_month     =  4'd0; // 1–12
+reg  [4:0] r_mday      =  5'd0; // 1–31
+reg  [8:0] r_doy       =  9'd0; // day-of-year, 0-based (0–365)
+reg        r_lp        =  1'b0; // leap-year flag for r_year
+
+// Combinational helpers used in the loop states.
+// Critical path per cycle: one 32-bit compare + 32-bit subtract ≈ 3 ns.
+wire [9:0] w_year_days = (r_year[1:0] == 2'b00) ? 10'd366 : 10'd365;
+
+function automatic [4:0] f_month_days(input [3:0] mon, input lp);
+    case (mon)
+        4'd1:  f_month_days = 5'd31;
+        4'd2:  f_month_days = lp ? 5'd29 : 5'd28;
+        4'd3:  f_month_days = 5'd31;
+        4'd4:  f_month_days = 5'd30;
+        4'd5:  f_month_days = 5'd31;
+        4'd6:  f_month_days = 5'd30;
+        4'd7:  f_month_days = 5'd31;
+        4'd8:  f_month_days = 5'd31;
+        4'd9:  f_month_days = 5'd30;
+        4'd10: f_month_days = 5'd31;
+        4'd11: f_month_days = 5'd30;
+        4'd12: f_month_days = 5'd31;
+        default: f_month_days = 5'd0;
+    endcase
+endfunction
+
+wire [4:0] w_month_days = f_month_days(r_month, r_lp);
+
+always @(posedge clk_sys) begin
+    rtc_ts_prev <= RTC_time[32];
+
+    case (rtc_state)
+
+    // -----------------------------------------------------------------------
+    // State 0: IDLE — wait for HPS timestamp toggle
+    3'd0:
+        if (rtc_ts_prev != RTC_time[32]) begin
+            r_remaining <= (RTC_time[31:0] >= UNIX_2000) ?
+                            RTC_time[31:0] - UNIX_2000 : 32'd0;
+            r_days      <= 16'd0;
+            r_wday      <=  3'd6; // Jan 1, 2000 = Saturday
+            rtc_state   <=  3'd1;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 1: DAYS_LOOP — subtract 86400 s/day until r_remaining < 86400.
+    // Path: 32-bit compare + subtract + small increments ≈ 3 ns.
+    // Worst case: ~36 523 iterations (year 2099) ≈ 365 µs at 100 MHz.
+    3'd1:
+        if (r_remaining >= 32'd86400) begin
+            r_remaining <= r_remaining - 32'd86400;
+            r_days      <= r_days + 16'd1;
+            r_wday      <= (r_wday == 3'd6) ? 3'd0 : r_wday + 3'd1;
+        end else begin
+            r_hour    <=  5'd0;
+            rtc_state <=  3'd2;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 2: HOURS_LOOP — subtract 3600 s/hour. Max 23 iterations.
+    3'd2:
+        if (r_remaining >= 32'd3600) begin
+            r_remaining <= r_remaining - 32'd3600;
+            r_hour      <= r_hour + 5'd1;
+        end else begin
+            r_min     <=  6'd0;
+            rtc_state <=  3'd3;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 3: MINS_LOOP — subtract 60 s/min. Max 59 iterations.
+    3'd3:
+        if (r_remaining >= 32'd60) begin
+            r_remaining <= r_remaining - 32'd60;
+            r_min       <= r_min + 6'd1;
+        end else begin
+            r_sec       <= r_remaining[5:0];     // 0–59, remainder is seconds
+            r_remaining <= {16'd0, r_days};       // repurpose for year loop
+            r_year      <=  7'd0;
+            rtc_state   <=  3'd4;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 4: YEAR_LOOP — subtract year lengths (365 or 366). Max 99 iters.
+    // w_year_days is combinatorial from r_year; path ≈ 2 ns.
+    3'd4:
+        if (r_remaining >= {22'd0, w_year_days}) begin
+            r_remaining <= r_remaining - {22'd0, w_year_days};
+            r_year      <= r_year + 7'd1;
+        end else begin
+            r_doy     <= r_remaining[8:0];           // 0-based day-of-year
+            r_lp      <= (r_year[1:0] == 2'b00);     // leap year?
+            r_month   <=  4'd1;
+            rtc_state <=  3'd5;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 5: MONTH_LOOP — subtract month lengths. Max 12 iterations.
+    // w_month_days is combinatorial from r_month + r_lp; path ≈ 3 ns.
+    3'd5:
+        if (r_doy >= {4'd0, w_month_days}) begin
+            r_doy   <= r_doy - {4'd0, w_month_days};
+            r_month <= r_month + 4'd1;
+        end else begin
+            r_mday    <= r_doy[4:0] + 5'd1; // convert 0-based → 1-based
+            rtc_state <=  3'd6;
+        end
+
+    // -----------------------------------------------------------------------
+    // State 6: BCD_ENCODE — divide each small field (≤ 7 bits) by constant 10.
+    // A 7-bit ÷ constant-10 divider synthesizes to a tiny LUT (≈ 3 ns).
+    // All fields are independent so the paths are evaluated in parallel.
+    3'd6: begin
+        RTC_timestampIn_BCD <= {
+            4'(r_year  / 7'd10), 4'(r_year  % 7'd10),  // [41:34] year
+            1'(r_month / 4'd10), 4'(r_month % 4'd10),  // [33:29] month
+            2'(r_mday  / 5'd10), 4'(r_mday  % 5'd10),  // [28:23] day
+            r_wday,                                      // [22:20] weekday
+            2'(r_hour  / 5'd10), 4'(r_hour  % 5'd10),  // [19:14] hour
+            3'(r_min   / 6'd10), 4'(r_min   % 6'd10),  // [13:7]  minute
+            3'(r_sec   / 6'd10), 4'(r_sec   % 6'd10)   // [6:0]   second
+        };
+        rtc_bcd_new <= ~rtc_bcd_new;
+        rtc_state   <=  3'd0;
+    end
+
+    default: rtc_state <= 3'd0;
+    endcase
+end
+// ---------------------------------------------------------------------------
+
 reg [7:0] rumble_reg = 0;
 
 always @(posedge clk_sys) begin
@@ -568,6 +730,8 @@ gba
    .RTC_timestampSaved(time_dout[42 +: 32]),
    .RTC_savedtimeIn(time_dout[0 +: 42]),
    .RTC_saveLoaded(RTC_load),
+   .RTC_timestampIn_BCD(RTC_timestampIn_BCD),
+   .RTC_timestampIn_BCD_new(rtc_bcd_new),
    .RTC_timestampOut(time_din[42 +: 32]),
    .RTC_savedtimeOut(time_din[0 +: 42]),
    .RTC_inuse(has_rtc),
