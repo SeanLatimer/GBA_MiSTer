@@ -558,9 +558,6 @@ reg [8:0]  r_doy     = 0; // day-of-year, 0-based               (0–365)
 reg [3:0]  r_month   = 0; // 1–12
 reg [4:0]  r_mday    = 0; // 1–31
 
-// Blocking work variable used within individual stages
-reg [8:0]  v_ms;
-
 always @(posedge clk_sys) begin
     rtc_ts_new_r <= RTC_time[32];
 
@@ -713,25 +710,24 @@ always @(posedge clk_sys) begin
 
         // -------------------------------------------------------------------
         // State 12: day-of-month — r_month and r_lp are both registered inputs,
-        // so the critical path is r_month→12-way decode→v_ms→subtract+add→r_mday
+        // so the critical path is r_month→12-way decode→subtract+add→r_mday
         // (~5–6 ns), well within budget.
         4'd12: begin
-            case (r_month)
-                4'd1:  v_ms = 9'd0;
-                4'd2:  v_ms = 9'd31;
-                4'd3:  v_ms = r_lp ? 9'd60  : 9'd59;
-                4'd4:  v_ms = r_lp ? 9'd91  : 9'd90;
-                4'd5:  v_ms = r_lp ? 9'd121 : 9'd120;
-                4'd6:  v_ms = r_lp ? 9'd152 : 9'd151;
-                4'd7:  v_ms = r_lp ? 9'd182 : 9'd181;
-                4'd8:  v_ms = r_lp ? 9'd213 : 9'd212;
-                4'd9:  v_ms = r_lp ? 9'd244 : 9'd243;
-                4'd10: v_ms = r_lp ? 9'd274 : 9'd273;
-                4'd11: v_ms = r_lp ? 9'd305 : 9'd304;
-                4'd12: v_ms = r_lp ? 9'd335 : 9'd334;
-                default: v_ms = 9'd0;
-            endcase
-            r_mday        <= 5'(r_doy - v_ms) + 5'd1; // 1-based day-of-month
+            r_mday <= 5'(r_doy - (
+                r_month == 4'd1  ? 9'd0                      :
+                r_month == 4'd2  ? 9'd31                     :
+                r_month == 4'd3  ? (r_lp ? 9'd60  : 9'd59)  :
+                r_month == 4'd4  ? (r_lp ? 9'd91  : 9'd90)  :
+                r_month == 4'd5  ? (r_lp ? 9'd121 : 9'd120) :
+                r_month == 4'd6  ? (r_lp ? 9'd152 : 9'd151) :
+                r_month == 4'd7  ? (r_lp ? 9'd182 : 9'd181) :
+                r_month == 4'd8  ? (r_lp ? 9'd213 : 9'd212) :
+                r_month == 4'd9  ? (r_lp ? 9'd244 : 9'd243) :
+                r_month == 4'd10 ? (r_lp ? 9'd274 : 9'd273) :
+                r_month == 4'd11 ? (r_lp ? 9'd305 : 9'd304) :
+                r_month == 4'd12 ? (r_lp ? 9'd335 : 9'd334) :
+                                   9'd0
+            )) + 5'd1; // 1-based day-of-month
             rtc_bcd_state <= 4'd11;
         end
 
