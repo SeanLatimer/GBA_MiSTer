@@ -79,6 +79,12 @@ architecture arch of gba_gpioRTCSolarGyro is
    signal rtc_change       : std_logic := '0';
    signal RTC_saveLoaded_1 : std_logic := '0';
    
+   -- Tracks whether tm_* has been seeded from any authoritative source (BCD
+   -- pipeline, save file, or game GPIO write) since the last GBA reset.
+   -- Prevents the BCD pipeline from overwriting a save-loaded or game-set time.
+   signal GBA_on_1         : std_logic := '0';
+   signal bcd_seed_done    : std_logic := '0';
+   
    signal saveCTL          : std_logic := '0';
    signal saveCTL_next     : std_logic := '0';
    signal CTLval           : std_logic_vector(7 downto 0) := x"40";
@@ -428,6 +434,12 @@ begin
          secondcount <= secondcount + 1;
          
          RTC_saveLoaded_1 <= RTC_saveLoaded;
+         GBA_on_1         <= GBA_on;
+         -- Clear the seed-done flag whenever the GBA is reset so the next boot
+         -- seeds tm_* from the BCD pipeline (or from a freshly loaded save).
+         if (GBA_on_1 = '1' and GBA_on = '0') then
+            bcd_seed_done <= '0';
+         end if;
          if (RTC_saveLoaded_1 = '0' and  RTC_saveLoaded = '1') then
          
             if (unsigned(RTC_timestamp) > unsigned(RTC_timestampSaved)) then
@@ -441,6 +453,8 @@ begin
             tm_hour <= unsigned(RTC_savedtimeIn(19 downto 14));
             tm_min  <= unsigned(RTC_savedtimeIn(13 downto 7));
             tm_sec  <= unsigned(RTC_savedtimeIn(6 downto 0));
+            -- Save data is now authoritative; block BCD pipeline from overwriting it.
+            bcd_seed_done <= '1';
          
            
          elsif (saveRTC_next = '1') then
@@ -452,6 +466,8 @@ begin
             tm_hour <= unsigned(data(4)(5 downto 0));
             tm_min  <= unsigned(data(5)(6 downto 0));
             tm_sec  <= unsigned(data(6)(6 downto 0));
+            -- Game has explicitly written the RTC time; block further BCD seeding.
+            bcd_seed_done <= '1';
             
          else
             
@@ -512,8 +528,12 @@ begin
          end if;
          -- Seed BCD time only after the pipeline has finished (BCD_new toggle),
          -- not at the timestamp-new edge where BCD is still zeros.
+         -- Only seed once per game session (bcd_seed_done='0'); after the first
+         -- seed the VHDL secondcount takes over, so we must not reset tm_* to
+         -- the current wall-clock time on every subsequent HPS timestamp update.
          if (RTC_timestampIn_BCD_new /= RTC_timestampIn_BCD_new_1) then
-            if (RTC_saveLoaded = '0') then
+            if (RTC_saveLoaded = '0' and bcd_seed_done = '0') then
+               bcd_seed_done <= '1';
                tm_year <= unsigned(RTC_timestampIn_BCD(41 downto 34));
                tm_mon  <= unsigned(RTC_timestampIn_BCD(33 downto 29));
                tm_mday <= unsigned(RTC_timestampIn_BCD(28 downto 23));

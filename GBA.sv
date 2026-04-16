@@ -525,15 +525,15 @@ reg RTC_load = 0;
 //   [13:7]  min   BCD 00-59
 //   [6:0]   sec   BCD 00-59
 //
-// Implemented as a 12-state clocked pipeline to avoid long combinational
+// Implemented as a 13-state clocked pipeline to avoid long combinational
 // paths from non-power-of-2 divisions.  Large constants (86400, 365) are
 // factored into small divisors split across two states each, keeping every
-// single-cycle path under 5 ns.  Latency is ~12 cycles; the result is
+// single-cycle path under 9 ns.  Latency is ~13 cycles; the result is
 // updated ~1 second after the first timestamp toggle, which is acceptable.
 // ---------------------------------------------------------------------------
 reg [41:0] RTC_timestampIn_BCD = 42'd0;
 reg        rtc_bcd_new = 0;    // toggle: set when BCD output is freshly valid
-reg [3:0]  rtc_bcd_state = 0;  // 4 bits; valid states 0-11 (12 used, 12-15 unused)
+reg [3:0]  rtc_bcd_state = 0;  // 4 bits; 13 states used (0–12), states 13–15 unused
 reg        rtc_ts_new_r = 0;
 
 localparam [31:0] UNIX_2000 = 32'd946684800; // Unix epoch for Jan 1, 2000
@@ -553,14 +553,12 @@ reg [13:0] r_temp5   = 0; // r_days / 5                        (≤ 9,942)
 reg [6:0]  r_year    = 0; // 0–99 (offset from 2000)
 reg [6:0]  r_ye_est  = 0; // year estimate (before correction)
 reg [15:0] r_ds_est  = 0; // days at start of estimated year
+reg        r_lp      = 0; // leap-year flag for the final r_year (precomputed in state 9)
 reg [8:0]  r_doy     = 0; // day-of-year, 0-based               (0–365)
 reg [3:0]  r_month   = 0; // 1–12
 reg [4:0]  r_mday    = 0; // 1–31
 
-// Blocking work variables used within individual stages
-reg [6:0]  v_ld;
-reg        v_lp;
-reg [3:0]  v_mo;
+// Blocking work variable used within individual stages
 reg [8:0]  v_ms;
 
 always @(posedge clk_sys) begin
@@ -647,65 +645,53 @@ always @(posedge clk_sys) begin
         // Year 2000 itself is a leap year (Y=0 → 0 leap days before it; Y=1 → 1).
         // Critical path: 7-bit × 9-bit multiply (~2 ns) + add chain (~3 ns)
         4'd8: begin
-            // v_ld = number of leap days that have elapsed before year r_year
-            v_ld          = (r_year == 7'd0) ? 7'd0 : ((r_year - 7'd1) >> 2) + 7'd1;
             r_ye_est      <= r_year;
-            r_ds_est      <= (16'(r_year) * 16'd365) + 16'(v_ld);
+            r_ds_est      <= (16'(r_year) * 16'd365) +
+                             16'(r_year == 7'd0 ? 7'd0 : ((r_year - 7'd1) >> 2) + 7'd1);
             rtc_bcd_state <= 4'd9;
         end
 
         // -------------------------------------------------------------------
-        // State 9: year correction — compare + mux + 16-bit subtract, no multiply
-        // If estimate overshot by exactly 1 year, correct using full 16-bit arithmetic
-        // (avoids the truncation-to-9-bit bug that was here previously).
+        // State 9: year correction — compare + mux + 16-bit subtract, no multiply.
+        // Also precomputes r_lp (the leap-year flag for the *final* r_year) so
+        // state 10 sees it as a registered input, eliminating the long
+        // r_year→v_lp combinational dependency from the state-10 critical path.
         // r_ye_est[1:0] == 2'b01  ↔  (r_ye_est-1) % 4 == 0  ↔  prev year is leap
         4'd9: begin
             if (r_ds_est > r_days) begin
                 r_year <= r_ye_est - 7'd1;
+                // (ye_est-1)[1:0]==0  ↔  ye_est[1:0]==2'b01
+                r_lp   <= (r_ye_est[1:0] == 2'b01);
                 // doy = r_days + year_len - r_ds_est  (≥ 0, ≤ 365; no 9-bit truncation before sub)
                 r_doy  <= 9'(r_days + (r_ye_est[1:0] == 2'b01 ? 16'd366 : 16'd365)
                              - r_ds_est);
             end else begin
                 r_year <= r_ye_est;
+                r_lp   <= (r_ye_est[1:0] == 2'b00); // ye_est[1:0]==0 ↔ leap year
                 r_doy  <= 9'(r_days - r_ds_est); // 16-bit sub → result 0–365, then narrow
             end
             rtc_bcd_state <= 4'd10;
         end
 
         // -------------------------------------------------------------------
-        // State 10: month and day-of-month (comparisons only, no division)
+        // State 10: month lookup only — r_lp is now a registered input (computed
+        // in state 9), so the critical path is r_lp+r_doy → 12-level priority
+        // encoder → r_month (~7–8 ns), well within budget.
+        // Day-of-month is deferred to state 12 to keep both paths short.
         4'd10: begin
-            v_lp = (r_year[1:0] == 2'd0); // leap year iff year%4==0 (valid 2000–2099)
-            if      (r_doy < 9'd31)                      v_mo = 4'd1;
-            else if (r_doy < (v_lp ? 9'd60 : 9'd59))    v_mo = 4'd2;
-            else if (r_doy < (v_lp ? 9'd91 : 9'd90))    v_mo = 4'd3;
-            else if (r_doy < (v_lp ? 9'd121 : 9'd120))  v_mo = 4'd4;
-            else if (r_doy < (v_lp ? 9'd152 : 9'd151))  v_mo = 4'd5;
-            else if (r_doy < (v_lp ? 9'd182 : 9'd181))  v_mo = 4'd6;
-            else if (r_doy < (v_lp ? 9'd213 : 9'd212))  v_mo = 4'd7;
-            else if (r_doy < (v_lp ? 9'd244 : 9'd243))  v_mo = 4'd8;
-            else if (r_doy < (v_lp ? 9'd274 : 9'd273))  v_mo = 4'd9;
-            else if (r_doy < (v_lp ? 9'd305 : 9'd304))  v_mo = 4'd10;
-            else if (r_doy < (v_lp ? 9'd335 : 9'd334))  v_mo = 4'd11;
-            else                                          v_mo = 4'd12;
-            case (v_mo)
-                4'd1:  v_ms = 9'd0;
-                4'd2:  v_ms = 9'd31;
-                4'd3:  v_ms = v_lp ? 9'd60  : 9'd59;
-                4'd4:  v_ms = v_lp ? 9'd91  : 9'd90;
-                4'd5:  v_ms = v_lp ? 9'd121 : 9'd120;
-                4'd6:  v_ms = v_lp ? 9'd152 : 9'd151;
-                4'd7:  v_ms = v_lp ? 9'd182 : 9'd181;
-                4'd8:  v_ms = v_lp ? 9'd213 : 9'd212;
-                4'd9:  v_ms = v_lp ? 9'd244 : 9'd243;
-                4'd10: v_ms = v_lp ? 9'd274 : 9'd273;
-                4'd11: v_ms = v_lp ? 9'd305 : 9'd304;
-                4'd12: v_ms = v_lp ? 9'd335 : 9'd334;
-                default: v_ms = 9'd0;
-            endcase
-            r_month       <= v_mo;
-            r_mday        <= 5'(r_doy - v_ms) + 5'd1; // 1-based day-of-month
-            rtc_bcd_state <= 4'd11;
+            if      (r_doy < 9'd31)                           r_month <= 4'd1;
+            else if (r_doy < (r_lp ? 9'd60  : 9'd59))        r_month <= 4'd2;
+            else if (r_doy < (r_lp ? 9'd91  : 9'd90))        r_month <= 4'd3;
+            else if (r_doy < (r_lp ? 9'd121 : 9'd120))       r_month <= 4'd4;
+            else if (r_doy < (r_lp ? 9'd152 : 9'd151))       r_month <= 4'd5;
+            else if (r_doy < (r_lp ? 9'd182 : 9'd181))       r_month <= 4'd6;
+            else if (r_doy < (r_lp ? 9'd213 : 9'd212))       r_month <= 4'd7;
+            else if (r_doy < (r_lp ? 9'd244 : 9'd243))       r_month <= 4'd8;
+            else if (r_doy < (r_lp ? 9'd274 : 9'd273))       r_month <= 4'd9;
+            else if (r_doy < (r_lp ? 9'd305 : 9'd304))       r_month <= 4'd10;
+            else if (r_doy < (r_lp ? 9'd335 : 9'd334))       r_month <= 4'd11;
+            else                                               r_month <= 4'd12;
+            rtc_bcd_state <= 4'd12;
         end
 
         // -------------------------------------------------------------------
@@ -723,6 +709,30 @@ always @(posedge clk_sys) begin
             };
             rtc_bcd_new   <= ~rtc_bcd_new; // signal that BCD output is now stable
             rtc_bcd_state <= 4'd0;
+        end
+
+        // -------------------------------------------------------------------
+        // State 12: day-of-month — r_month and r_lp are both registered inputs,
+        // so the critical path is r_month→12-way decode→v_ms→subtract+add→r_mday
+        // (~5–6 ns), well within budget.
+        4'd12: begin
+            case (r_month)
+                4'd1:  v_ms = 9'd0;
+                4'd2:  v_ms = 9'd31;
+                4'd3:  v_ms = r_lp ? 9'd60  : 9'd59;
+                4'd4:  v_ms = r_lp ? 9'd91  : 9'd90;
+                4'd5:  v_ms = r_lp ? 9'd121 : 9'd120;
+                4'd6:  v_ms = r_lp ? 9'd152 : 9'd151;
+                4'd7:  v_ms = r_lp ? 9'd182 : 9'd181;
+                4'd8:  v_ms = r_lp ? 9'd213 : 9'd212;
+                4'd9:  v_ms = r_lp ? 9'd244 : 9'd243;
+                4'd10: v_ms = r_lp ? 9'd274 : 9'd273;
+                4'd11: v_ms = r_lp ? 9'd305 : 9'd304;
+                4'd12: v_ms = r_lp ? 9'd335 : 9'd334;
+                default: v_ms = 9'd0;
+            endcase
+            r_mday        <= 5'(r_doy - v_ms) + 5'd1; // 1-based day-of-month
+            rtc_bcd_state <= 4'd11;
         end
 
         default: rtc_bcd_state <= 4'd0;
